@@ -1,92 +1,105 @@
-import pydicom
+import logging
+from datetime import datetime
 from pydicom.dataset import Dataset
 from pynetdicom import AE, evt, debug_logger
-from pynetdicom.sop_class import PatientRootQueryRetrieveInformationModelFind, PatientRootQueryRetrieveInformationModelMove
+from pynetdicom.sop_class import (
+    PatientRootQueryRetrieveInformationModelMove,
+    PatientRootQueryRetrieveInformationModelFind,
+    VerificationSOPClass
+)
 
-#from pydicom.uid import Verification
+# Enable debug logging to a file
+log_filename = f"dicom_transfer_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+logging.basicConfig(
+    filename=log_filename,
+    filemode='w',
+    format='%(asctime)s %(levelname)s: %(message)s',
+    level=logging.DEBUG
+)
 
+# Log everything to terminal too
+console = logging.StreamHandler()
+console.setLevel(logging.INFO)
+formatter = logging.Formatter('%(asctime)s %(levelname)s: %(message)s')
+console.setFormatter(formatter)
+logging.getLogger().addHandler(console)
 
-# Enable logging
-debug_logger()
+# Optional: for extremely detailed protocol-level debugging
+# debug_logger()  # Uncomment if needed
 
-# Define the DICOM servers
-source_ae_title = 'SYNCARD'
-source_ip = '163.246.181.8'
-source_port = 104
+def handle_event(event):
+    logging.info(f"Received event: {event}")
 
-destination_ae_title = 'ORTHANC'
-destination_ip = '163.246.4.11'
-destination_port = 4242
-# Define the patient ID
-patient_id = '12345689'
-
-ae = AE()
-# Add requested presentation context
-ae.add_requested_context('1.2.840.10008.1.1')
-
-# Associate with the peer AE
-assoc = ae.associate(destination_ip, destination_port, ae_title=destination_ae_title)
-
-if assoc.is_established:
-    # Send a C-ECHO request to the peer
-    status = assoc.send_c_echo()
-
-    # Check the status of the response
-    if status:
-        print('C-ECHO request status: 0x{0:04x}'.format(status.Status))
-    else:
-        print('Connection timed out, was aborted or received invalid response')
-
-    # Release the association
-    assoc.release()
-else:
-    print('Association with server failed')
-
-
-
-# Create an Application Entity
-ae = AE()
+# Define AE
+ae = AE(ae_title='ORTHANC')
 
 # Add requested presentation contexts
+ae.add_requested_context(VerificationSOPClass)
 ae.add_requested_context(PatientRootQueryRetrieveInformationModelFind)
 ae.add_requested_context(PatientRootQueryRetrieveInformationModelMove)
 
-# Create a dataset for the C-FIND request
-ds = Dataset()
-ds.PatientID = patient_id
-ds.QueryRetrieveLevel = 'PATIENT'
+# Define Fuji PACS (SYNCARD)
+fuji_ip = '163.246.181.8'
+fuji_port = 104
+fuji_ae_title = 'SYNCARD'
 
-# Function to handle C-MOVE responses
-def handle_move(event):
-    return 0x0000
-handlers = [(evt.EVT_C_MOVE, handle_move)]
+# Define move destination (your Orthanc AE)
+destination_ae_title = 'ORTHANC'
 
-# Perform the C-FIND request to get the study instance UID
-assoc = ae.associate(source_ip, source_port, ae_title=source_ae_title)
-if assoc.is_established:
-    responses = assoc.send_c_find(ds, PatientRootQueryRetrieveInformationModelFind)
-    study_instance_uid = None
-    for (status, identifier) in responses:
-        if status and status.Status == 0xFF00:
-            study_instance_uid = identifier.StudyInstanceUID
-            break
-    assoc.release()
-else:
-    print("Association with source server failed")
+# Define patient ID
+patient_id = '7299149'
 
-# Perform the C-MOVE request to transfer the study to the destination server
-if study_instance_uid:
-    ds = Dataset()
-    ds.QueryRetrieveLevel = 'STUDY'
-    ds.StudyInstanceUID = study_instance_uid
-
-    assoc = ae.associate(source_ip, source_port, ae_title=source_ae_title, evt_handlers=handlers)
+try:
+    # Association
+    assoc = ae.associate(fuji_ip, fuji_port, ae_title=fuji_ae_title)
     if assoc.is_established:
-        assoc.send_c_move(ds, destination_ae_title, PatientRootQueryRetrieveInformationModelMove)
+        logging.info(f"Association established with {fuji_ae_title} ({fuji_ip}:{fuji_port})")
+
+        # Study-level C-FIND to get StudyInstanceUID
+        ds = Dataset()
+        ds.QueryRetrieveLevel = 'STUDY'
+        ds.PatientID = patient_id
+        ds.StudyInstanceUID = ''
+
+        responses = assoc.send_c_find(ds, PatientRootQueryRetrieveInformationModelFind)
+        study_instance_uid = None
+        for (status, identifier) in responses:
+            if status and status.Status in [0xFF00, 0xFF01]:  # Pending
+                study_instance_uid = identifier.StudyInstanceUID
+                logging.info(f"Found StudyInstanceUID: {study_instance_uid}")
+            elif status and status.Status == 0x0000:
+                logging.info("C-FIND completed successfully")
+            elif status:
+                logging.warning(f"C-FIND returned status: 0x{status.Status:04x}")
+        
+        if not study_instance_uid:
+            raise Exception("StudyInstanceUID not found, aborting.")
+
+        # C-MOVE to fetch the study into Orthanc
+        move_ds = Dataset()
+        move_ds.QueryRetrieveLevel = 'STUDY'
+        move_ds.StudyInstanceUID = study_instance_uid
+
+        logging.info(f"Sending C-MOVE request for StudyInstanceUID: {study_instance_uid}")
+        responses = assoc.send_c_move(move_ds, destination_ae_title, PatientRootQueryRetrieveInformationModelMove)
+
+        for (status, identifier) in responses:
+            if status:
+                logging.info(
+                    f"C-MOVE response - Status: 0x{status.Status:04X}, "
+                    f"Remaining: {status.get('NumberOfRemainingSuboperations', 'N/A')}, "
+                    f"Completed: {status.get('NumberOfCompletedSuboperations', 'N/A')}, "
+                    f"Failed: {status.get('NumberOfFailedSuboperations', 'N/A')}, "
+                    f"Warning: {status.get('NumberOfWarningSuboperations', 'N/A')}"
+                )
+            else:
+                logging.warning("C-MOVE returned no status")
+
         assoc.release()
+        logging.info("Association released")
+
     else:
-        print("Association with source server failed")
-else:
-    print("Study instance UID not found")
+        logging.error(f"Could not establish association with {fuji_ae_title} ({fuji_ip}:{fuji_port})")
 
-
+except Exception as e:
+    logging.exception(f"Error during DICOM transfer: {e}")
