@@ -5,45 +5,47 @@ from pynetdicom import AE
 from pynetdicom.sop_class import (
     PatientRootQueryRetrieveInformationModelMove,
     PatientRootQueryRetrieveInformationModelFind,
-    VerificationSOPClass
+    VerificationSOPClass,
 )
 
-# -------------------------------
+# ==========================================================
 # Logging Setup
-# -------------------------------
+# ==========================================================
 log_filename = f"dicom_transfer_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+
 logging.basicConfig(
     filename=log_filename,
-    filemode='w',
-    format='%(asctime)s %(levelname)s: %(message)s',
-    level=logging.DEBUG
+    filemode="w",
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    level=logging.DEBUG,
 )
 
-# Log to console also
-console = logging.StreamHandler()
-console.setLevel(logging.INFO)
-formatter = logging.Formatter('%(asctime)s %(levelname)s: %(message)s')
-console.setFormatter(formatter)
-logging.getLogger().addHandler(console)
+# Log to console in addition to file
+console_handler = logging.StreamHandler()
+console_handler.setLevel(logging.INFO)
+console_formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+console_handler.setFormatter(console_formatter)
+logging.getLogger().addHandler(console_handler)
 
+logger = logging.getLogger(__name__)
 
-# -------------------------------
+# ==========================================================
 # DICOM AE Configuration
-# -------------------------------
-LOCAL_AET = 'ORTHANC'         # Local AE Title (Orthanc)
-FUJI_AET = 'SYNCARD'          # Fuji PACS AE Title
-FUJI_IP = '163.246.181.8'     # Fuji PACS IP
-FUJI_PORT = 104               # Fuji PACS Port
+# ==========================================================
+LOCAL_AET = "ORTHANC"          # Local AE Title (Orthanc must be listening)
+FUJI_AET = "SYNCARD"           # Fuji PACS AE Title
+FUJI_IP = "163.246.181.8"      # Fuji PACS IP
+FUJI_PORT = 104                # Fuji PACS Port
 
-# Patient to query/move
-PATIENT_ID = '083008622'      # Change as needed
+# Patient ID for testing C-MOVE
+PATIENT_ID = "083008622"       # Change as needed
 
 
-# -------------------------------
-# Main DICOM Move
-# -------------------------------
+# ==========================================================
+# Main DICOM Move Execution
+# ==========================================================
 try:
-    # Initialize local AE
+    logger.info("Initializing local AE with AE Title: %s", LOCAL_AET)
     ae = AE(ae_title=LOCAL_AET)
 
     # Add required presentation contexts
@@ -51,46 +53,45 @@ try:
     ae.add_requested_context(PatientRootQueryRetrieveInformationModelFind)
     ae.add_requested_context(PatientRootQueryRetrieveInformationModelMove)
 
-    logging.info(f"Requesting association with {FUJI_AET} at {FUJI_IP}:{FUJI_PORT}...")
-
-    # Establish association to Fuji PACS
+    logger.info("Attempting association with %s at %s:%s", FUJI_AET, FUJI_IP, FUJI_PORT)
     assoc = ae.associate(FUJI_IP, FUJI_PORT, ae_title=FUJI_AET)
 
     if assoc.is_established:
-        logging.info(f"Association established with {FUJI_AET} ({FUJI_IP}:{FUJI_PORT})")
+        logger.info("Association successfully established with %s (%s:%s)", FUJI_AET, FUJI_IP, FUJI_PORT)
 
-        # Build C-MOVE dataset at PATIENT level
+        # Build C-MOVE request dataset at PATIENT level
         move_ds = Dataset()
-        move_ds.QueryRetrieveLevel = 'PATIENT'
+        move_ds.QueryRetrieveLevel = "PATIENT"
         move_ds.PatientID = PATIENT_ID
 
-        logging.info(f"Sending C-MOVE request for PatientID={PATIENT_ID} to move to {LOCAL_AET}")
+        logger.info("Sending C-MOVE request for PatientID=%s with destination AE=%s", PATIENT_ID, LOCAL_AET)
 
         # Send C-MOVE request
         responses = assoc.send_c_move(
             move_ds,
-            LOCAL_AET,  # Destination AE (Orthanc must be listening!)
-            PatientRootQueryRetrieveInformationModelMove
+            LOCAL_AET,  # Destination AE (Orthanc must accept incoming C-STORE)
+            PatientRootQueryRetrieveInformationModelMove,
         )
 
         # Process responses
-        for (status, identifier) in responses:
+        for status, identifier in responses:
             if status:
-                logging.info(
-                    f"C-MOVE Response: Status=0x{status.Status:04X}, "
-                    f"Remaining={getattr(status, 'NumberOfRemainingSuboperations', 'N/A')}, "
-                    f"Completed={getattr(status, 'NumberOfCompletedSuboperations', 'N/A')}, "
-                    f"Failed={getattr(status, 'NumberOfFailedSuboperations', 'N/A')}, "
-                    f"Warning={getattr(status, 'NumberOfWarningSuboperations', 'N/A')}"
+                logger.info(
+                    "C-MOVE Response: Status=0x%04X | Remaining=%s | Completed=%s | Failed=%s | Warning=%s",
+                    status.Status,
+                    getattr(status, "NumberOfRemainingSuboperations", "N/A"),
+                    getattr(status, "NumberOfCompletedSuboperations", "N/A"),
+                    getattr(status, "NumberOfFailedSuboperations", "N/A"),
+                    getattr(status, "NumberOfWarningSuboperations", "N/A"),
                 )
             else:
-                logging.warning("C-MOVE returned no status")
+                logger.warning("C-MOVE response returned no status object")
 
         assoc.release()
-        logging.info("Association released")
+        logger.info("Association released successfully")
 
     else:
-        logging.error(f"Could not establish association with {FUJI_AET} ({FUJI_IP}:{FUJI_PORT})")
+        logger.error("Failed to establish association with %s (%s:%s)", FUJI_AET, FUJI_IP, FUJI_PORT)
 
 except Exception as e:
-    logging.exception(f"Error during DICOM transfer: {e}")
+    logger.exception("Unexpected error during DICOM transfer: %s", str(e))
